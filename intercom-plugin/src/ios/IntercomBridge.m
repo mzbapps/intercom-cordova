@@ -63,11 +63,12 @@
     }
     
     [Intercom loginUserWithUserAttributes:userAttributes success:^{
+        NSLog(@"[Intercom-Cordova] INFO - Identified user login completed");
         [self sendSuccess:command];
     } failure:^(NSError * _Nonnull error) {
+        NSLog(@"[Intercom-Cordova] ERROR - Identified user login failed: domain=%@ code=%ld", error.domain, (long)error.code);
         [self sendFailure:command withError:error];
     }];
-    [self sendSuccess:command];
 }
 
 - (void)loginUnidentifiedUser:(CDVInvokedUrlCommand*)command {
