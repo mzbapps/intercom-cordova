@@ -10,6 +10,30 @@
 + (void)setCordovaVersion:(NSString *)v;
 @end
 
+static NSTimeInterval const IntercomLogoutPollInterval = 0.1;
+static NSTimeInterval const IntercomLogoutMaximumWait = 0.75;
+static NSUInteger const IntercomLogoutRequiredClearChecks = 3;
+static NSUInteger IntercomDiagnosticOperationSequence = 0;
+
+#ifdef DEBUG
+#define INTERCOM_DIAGNOSTIC_LOG(...) NSLog(__VA_ARGS__)
+#else
+#define INTERCOM_DIAGNOSTIC_LOG(...)
+#endif
+
+@interface IntercomBridge ()
+- (void)sendLogoutResult:(CDVInvokedUrlCommand *)command
+               stabilized:(BOOL)stabilized
+                 elapsed:(NSTimeInterval)elapsed
+                 loggedIn:(BOOL)loggedIn
+        attributesPresent:(BOOL)attributesPresent
+              clearChecks:(NSUInteger)clearChecks;
+- (void)waitForIntercomLogout:(CDVInvokedUrlCommand *)command
+                    startedAt:(NSTimeInterval)startedAt
+           consecutiveClears:(NSUInteger)consecutiveClears
+                    operation:(NSUInteger)operation;
+@end
+
 @implementation IntercomBridge : CDVPlugin
 
 
@@ -26,12 +50,19 @@
     NSString* appId = self.commandDelegate.settings[@"intercom-app-id"] ?: [[NSBundle mainBundle] objectForInfoDictionaryKey:@"IntercomAppId"];
 
     [Intercom setApiKey:apiKey forAppId:appId];
+    INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=plugin_initialized");
 }
 
 - (void)setUserHash:(CDVInvokedUrlCommand*)command {
     NSString *hmac = command.arguments[0];
-    
+    NSUInteger operation = ++IntercomDiagnosticOperationSequence;
+
+    INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=set_user_hash_requested operation=%lu hashPresent=%@",
+                           (unsigned long)operation,
+                           hmac.length > 0 ? @"true" : @"false");
     [Intercom setUserHash:hmac];
+    INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=set_user_hash_completed operation=%lu",
+                           (unsigned long)operation);
     [self sendSuccess:command];
 }
 
@@ -41,12 +72,22 @@
     NSDictionary* options = command.arguments[0];
     NSString* userId = options[@"userId"];
     NSString* userEmail = options[@"email"];
+    NSUInteger operation = ++IntercomDiagnosticOperationSequence;
+    NSTimeInterval startedAt = [NSDate timeIntervalSinceReferenceDate];
+    BOOL loggedInBefore = [Intercom isUserLoggedIn];
+    BOOL attributesPresentBefore = [Intercom fetchLoggedInUserAttributes] != nil;
 
     if ([userId isKindOfClass:[NSNumber class]]) {
         userId = [(NSNumber *)userId stringValue];
     }
 
     ICMUserAttributes *userAttributes = [ICMUserAttributes new];
+    INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=identified_login_requested operation=%lu loggedIn=%@ attributesPresent=%@ hasUserId=%@ hasEmail=%@",
+                           (unsigned long)operation,
+                           loggedInBefore ? @"true" : @"false",
+                           attributesPresentBefore ? @"true" : @"false",
+                           userId.length > 0 ? @"true" : @"false",
+                           userEmail.length > 0 ? @"true" : @"false");
     
     if (userId.length > 0 && userEmail.length > 0) {
         userAttributes.userId = userId;
@@ -57,15 +98,27 @@
         userAttributes.email = userEmail;
     } else {
         NSLog(@"[Intercom-Cordova] ERROR - No user registered. You must supply an email, a userId or both");
-        [self.commandDelegate sendPluginResult:[CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR]
-                                    callbackId:command.callbackId];
+        NSError *error = [NSError errorWithDomain:@"IntercomCordovaBridge"
+                                             code:1001
+                                         userInfo:@{NSLocalizedDescriptionKey: @"An identified Intercom user requires an email or user ID."}];
+        [self sendFailure:command withError:error];
         return;
     }
     
     [Intercom loginUserWithUserAttributes:userAttributes success:^{
+        NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - startedAt;
+        INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=identified_login_completed operation=%lu elapsedMs=%.0f",
+                               (unsigned long)operation,
+                               elapsed * 1000.0);
         NSLog(@"[Intercom-Cordova] INFO - Identified user login completed");
         [self sendSuccess:command];
     } failure:^(NSError * _Nonnull error) {
+        NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - startedAt;
+        INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=identified_login_failed operation=%lu elapsedMs=%.0f domain=%@ code=%ld",
+                               (unsigned long)operation,
+                               elapsed * 1000.0,
+                               error.domain,
+                               (long)error.code);
         NSLog(@"[Intercom-Cordova] ERROR - Identified user login failed: domain=%@ code=%ld", error.domain, (long)error.code);
         [self sendFailure:command withError:error];
     }];
@@ -80,25 +133,98 @@
 }
 
 - (void)logout:(CDVInvokedUrlCommand*)command {
+    NSUInteger operation = ++IntercomDiagnosticOperationSequence;
+    NSTimeInterval startedAt = [NSDate timeIntervalSinceReferenceDate];
+    BOOL loggedInBefore = [Intercom isUserLoggedIn];
+    BOOL attributesPresentBefore = [Intercom fetchLoggedInUserAttributes] != nil;
+    INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=logout_requested operation=%lu loggedIn=%@ attributesPresent=%@",
+                           (unsigned long)operation,
+                           loggedInBefore ? @"true" : @"false",
+                           attributesPresentBefore ? @"true" : @"false");
     [Intercom logout];
-    [self sendSuccess:command];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self waitForIntercomLogout:command
+                          startedAt:startedAt
+                 consecutiveClears:0
+                          operation:operation];
+    });
+}
+
+- (void)waitForIntercomLogout:(CDVInvokedUrlCommand *)command
+                    startedAt:(NSTimeInterval)startedAt
+           consecutiveClears:(NSUInteger)consecutiveClears
+                    operation:(NSUInteger)operation {
+    BOOL loggedIn = [Intercom isUserLoggedIn];
+    BOOL attributesPresent = [Intercom fetchLoggedInUserAttributes] != nil;
+    BOOL identityCleared = !loggedIn && !attributesPresent;
+    NSUInteger nextConsecutiveClears = identityCleared ? consecutiveClears + 1 : 0;
+    NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - startedAt;
+    INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=logout_observation operation=%lu elapsedMs=%.0f loggedIn=%@ attributesPresent=%@ clearChecks=%lu",
+                           (unsigned long)operation,
+                           elapsed * 1000.0,
+                           loggedIn ? @"true" : @"false",
+                           attributesPresent ? @"true" : @"false",
+                           (unsigned long)nextConsecutiveClears);
+
+    if (nextConsecutiveClears >= IntercomLogoutRequiredClearChecks) {
+        NSLog(@"[Intercom-Cordova] INFO - Logout state stabilized after %.0f ms operation=%lu",
+              elapsed * 1000.0,
+              (unsigned long)operation);
+        [self sendLogoutResult:command
+                    stabilized:YES
+                      elapsed:elapsed
+                      loggedIn:loggedIn
+             attributesPresent:attributesPresent
+                   clearChecks:nextConsecutiveClears];
+        return;
+    }
+
+    if (elapsed >= IntercomLogoutMaximumWait) {
+        NSLog(@"[Intercom-Cordova] WARN - Logout state did not stabilize after %.0f ms; continuing best effort (operation=%lu loggedIn=%@ attributesPresent=%@ clearChecks=%lu)",
+              elapsed * 1000.0,
+              (unsigned long)operation,
+              loggedIn ? @"true" : @"false",
+              attributesPresent ? @"true" : @"false",
+              (unsigned long)nextConsecutiveClears);
+        [self sendLogoutResult:command
+                    stabilized:NO
+                      elapsed:elapsed
+                      loggedIn:loggedIn
+             attributesPresent:attributesPresent
+                   clearChecks:nextConsecutiveClears];
+        return;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(IntercomLogoutPollInterval * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self waitForIntercomLogout:command
+                          startedAt:startedAt
+                 consecutiveClears:nextConsecutiveClears
+                          operation:operation];
+    });
 }
 
 - (void)isUserLoggedIn:(CDVInvokedUrlCommand*)command {
     BOOL loggedIn = [Intercom isUserLoggedIn];
+    INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=login_state_read loggedIn=%@",
+                           loggedIn ? @"true" : @"false");
     CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsBool:loggedIn];
     [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
 - (void)fetchLoggedInUserAttributes:(CDVInvokedUrlCommand*)command {
     ICMUserAttributes *attributes = [Intercom fetchLoggedInUserAttributes];
+    INTERCOM_DIAGNOSTIC_LOG(@"[Intercom-Cordova-Diagnostic] stage=attributes_read attributesPresent=%@",
+                           attributes ? @"true" : @"false");
     if (attributes) {
         NSString *jsonString = [self stringValueForDictionary:[attributes toDictionary]];
         CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:jsonString];
         [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
     } else {
-        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsNSInteger:command.callbackId];
-        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        NSError *error = [NSError errorWithDomain:@"IntercomCordovaBridge"
+                                             code:1002
+                                         userInfo:@{NSLocalizedDescriptionKey: @"No logged-in Intercom user attributes were available."}];
+        [self sendFailure:command withError:error];
     }
 }
 
@@ -109,7 +235,6 @@
     } failure:^(NSError * _Nonnull error) {
         [self sendFailure:command withError:error];
     }];
-    [self sendSuccess:command];
 }
 
 #pragma mark - Events
@@ -293,9 +418,16 @@
     [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:(UNAuthorizationOptionAlert
                                                                                            | UNAuthorizationOptionBadge
                                                                                            | UNAuthorizationOptionSound)
-                                                                        completionHandler:^(BOOL granted, NSError * _Nullable error) {}];
-    [application registerForRemoteNotifications];
-    [self sendSuccess:command];
+                                                                        completionHandler:^(BOOL granted, NSError * _Nullable error) {
+        if (error) {
+            [self sendFailure:command withError:error];
+            return;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [application registerForRemoteNotifications];
+            [self sendSuccess:command];
+        });
+    }];
 }
 
 - (void)sendPushTokenToIntercom:(CDVInvokedUrlCommand*)command {
@@ -431,14 +563,77 @@
 
 #pragma mark - Private methods
 
+- (void)sendLogoutResult:(CDVInvokedUrlCommand *)command
+               stabilized:(BOOL)stabilized
+                 elapsed:(NSTimeInterval)elapsed
+                 loggedIn:(BOOL)loggedIn
+        attributesPresent:(BOOL)attributesPresent
+              clearChecks:(NSUInteger)clearChecks {
+    NSDictionary *details = @{
+        @"stabilized": @(stabilized),
+        @"elapsedMs": @(elapsed * 1000.0),
+        @"loggedIn": @(loggedIn),
+        @"attributesPresent": @(attributesPresent),
+        @"clearChecks": @(clearChecks)
+    };
+    CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                                   messageAsDictionary:details];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+}
+
 - (void)sendSuccess:(CDVInvokedUrlCommand*)command {
     CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
     [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
+- (NSString *)sanitizedErrorDomain:(NSString *)domain {
+    if (![domain isKindOfClass:[NSString class]] || domain.length == 0) {
+        return @"IntercomError";
+    }
+    NSRegularExpression *expression = [NSRegularExpression regularExpressionWithPattern:@"[^A-Za-z0-9._-]"
+                                                                                 options:0
+                                                                                   error:nil];
+    NSString *sanitized = [expression stringByReplacingMatchesInString:domain
+                                                                options:0
+                                                                  range:NSMakeRange(0, domain.length)
+                                                           withTemplate:@"_"];
+    return sanitized.length > 120 ? [sanitized substringToIndex:120] : sanitized;
+}
+
+- (NSString *)sanitizedErrorMessage:(NSString *)message {
+    if (![message isKindOfClass:[NSString class]] || message.length == 0) {
+        return @"Intercom operation failed.";
+    }
+    NSString *sanitized = [[message componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] componentsJoinedByString:@" "];
+    NSArray<NSDictionary<NSString *, NSString *> *> *replacements = @[
+        @{@"pattern": @"[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", @"value": @"[redacted-email]"},
+        @{@"pattern": @"(?i)(password|sessionToken|masterKey|javascriptKey|authorization|token|user[_-]?hash|user[_-]?id)(\\s*[:=]\\s*)[^\\s,;]+", @"value": @"$1$2[redacted]"},
+        @{@"pattern": @"https?://[^\\s]+", @"value": @"[redacted-url]"}
+    ];
+    for (NSDictionary<NSString *, NSString *> *replacement in replacements) {
+        NSRegularExpression *expression = [NSRegularExpression regularExpressionWithPattern:replacement[@"pattern"]
+                                                                                     options:NSRegularExpressionCaseInsensitive
+                                                                                       error:nil];
+        sanitized = [expression stringByReplacingMatchesInString:sanitized
+                                                          options:0
+                                                            range:NSMakeRange(0, sanitized.length)
+                                                     withTemplate:replacement[@"value"]];
+    }
+    sanitized = [sanitized stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (sanitized.length == 0) {
+        return @"Intercom operation failed.";
+    }
+    return sanitized.length > 300 ? [sanitized substringToIndex:300] : sanitized;
+}
+
 - (void)sendFailure:(CDVInvokedUrlCommand*)command withError:(NSError *)error {
+    NSDictionary *details = @{
+        @"code": @(error.code),
+        @"domain": [self sanitizedErrorDomain:error.domain],
+        @"message": [self sanitizedErrorMessage:error.localizedDescription]
+    };
     CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR
-                                                   messageAsNSInteger:error.code];
+                                                   messageAsDictionary:details];
     [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
