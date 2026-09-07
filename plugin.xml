@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<plugin id="cordova-plugin-intercom" version="16.5.0" xmlns="http://apache.org/cordova/ns/plugins/1.0" xmlns:android="http://schemas.android.com/apk/res/android">
+<plugin id="cordova-plugin-intercom" version="16.5.0" xmlns="http://apache.org/cordova/ns/plugins/1.0" xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
     <name>Intercom</name>
     <author>Intercom</author>
     <license>MIT License</license>
@@ -81,6 +81,7 @@
       <source-file src="src/android/RegistrationModel.java" target-dir="src/io/intercom/android/sdk" />
       <source-file src="src/android/CordovaHeaderInterceptor.java" target-dir="src/io/intercom/android/sdk" />
       <source-file src="src/android/IntercomInitProvider.java" target-dir="src/io/intercom/android/sdk" />
+      <source-file src="src/android/IntercomCordovaFcmMessengerService.java" target-dir="src/io/intercom/android/sdk" />
 
       <framework src="src/android/intercom.gradle" custom="true" type="gradleReference" />
       <framework src="src/android/build-extras-intercom.gradle" custom="true" type="gradleReference" />
@@ -93,6 +94,17 @@
       </config-file>
 
       <config-file target="AndroidManifest.xml" parent="/manifest/application">
+        <service
+            android:name="io.intercom.android.sdk.fcm.IntercomFcmMessengerService"
+            tools:node="remove" />
+        <service
+            android:name="io.intercom.android.sdk.IntercomCordovaFcmMessengerService"
+            android:exported="false">
+          <intent-filter android:priority="-400">
+            <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            <action android:name="com.google.firebase.INSTANCE_ID_EVENT" />
+          </intent-filter>
+        </service>
         <provider
             android:name="io.intercom.android.sdk.IntercomInitProvider"
             android:authorities="${applicationId}.intercom-cordova.initprovider"
